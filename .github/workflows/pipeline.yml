@@ -1,4 +1,4 @@
-name: First Pipeline Test
+name: Security CI
 
 on:
   push:
@@ -7,11 +7,106 @@ on:
     branches: [ "main" ]
 
 jobs:
-  hello:
+  prepare:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Set up Node/Python/Java (sesuaikan)...
+      - name: Build app (if needed) ...
 
-      - name: Print hello
-        run: echo "Pipeline jalan! 🚀"
+  secret-scan:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run TruffleHog
+        run: trufflehog git --json . > truffle-report.json || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: secret-report
+          path: truffle-report.json
+
+  sca:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run SCA (OWASP Dep-Check / Snyk)
+        run: |
+          # example: dependency-check --format ALL --out reports/
+          snyk test --json > sca-report.json || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sca-report
+          path: sca-report.json
+
+  sast:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep
+        run: semgrep --config auto --json --output sast-report.json || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sast-report
+          path: sast-report.json
+
+  misconfig:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Checkov
+        run: checkov -d . -o json > checkov-report.json || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checkov-report
+          path: checkov-report.json
+
+  dast:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to staging (if needed)
+        run: ./scripts/deploy-staging.sh
+      - name: Run OWASP ZAP baseline
+        run: zap-baseline.py -t http://staging.example -r zap-report.html || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dast-report
+          path: zap-report.html
+
+  aggregate-and-notify:
+    needs: [secret-scan, sca, sast, misconfig, dast]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download reports
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          name: secret-report
+      - name: Parse reports + determine severity
+        id: agg
+        run: |
+          python scripts/parse_reports.py --inputs reports/ --out summary.json
+          # parsers should set exit code 0 but write output severity to summary.json
+          cat summary.json
+          echo "::set-output name=max_severity::$(jq -r .max_severity summary.json)"
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: summary
+          path: summary.json
+      - name: Notify Slack if high/critical
+        if: steps.agg.outputs.max_severity == 'HIGH' || steps.agg.outputs.max_severity == 'CRITICAL'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python scripts/notify_slack.py --webhook $SLACK_WEBHOOK_URL --report summary.json
+      - name: Fail pipeline on critical
+        if: steps.agg.outputs.max_severity == 'CRITICAL'
+        run: |
+          echo "Critical vuln found. Failing pipeline."
+          exit 1
