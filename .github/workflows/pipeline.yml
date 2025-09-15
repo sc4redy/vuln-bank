@@ -82,4 +82,3 @@ jobs:
           message: |
             ⚠️ Critical vulnerability detected in **vuln-bank** repo!
             Cek detail report di GitHub Actions artifacts.
-
