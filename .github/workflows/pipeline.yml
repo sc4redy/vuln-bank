@@ -77,8 +77,10 @@ jobs:
       - name: Send Discord Notification
         if: steps.vulncheck.outputs.critical_found == 'true'
         uses: Ilshidur/action-discord@master
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         with:
-          webhook: ${{ secrets.DISCORD_WEBHOOK }}
-          message: |
+          args: |
             ⚠️ Critical vulnerability detected in **vuln-bank** repo!
             Cek detail report di GitHub Actions artifacts.
+
