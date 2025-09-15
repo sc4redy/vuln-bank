@@ -61,3 +61,28 @@ jobs:
         with:
           name: trivy-config-report
           path: trivy-config-report.txt
+
+      # ✅ Check for Critical Vulnerabilities and Notify Slack
+      - name: Check for Critical Vulns
+        id: vulncheck
+        run: |
+          # Gabung semua report jadi satu file
+          cat bandit-report.txt trivy-config-report.txt > all-reports.txt
+          if grep -qi "CRITICAL" all-reports.txt; then
+            echo "critical_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "critical_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Slack Notification
+        if: steps.vulncheck.outputs.critical_found == 'true'
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_USERNAME: "VulnBank Security Bot"
+          SLACK_TITLE: "⚠️ Critical Vulnerability Detected!"
+          SLACK_MESSAGE: |
+            Pipeline menemukan vulnerability **CRITICAL** pada repo vuln-bank.
+            Cek detail report di GitHub Actions artifacts.
+          SLACK_COLOR: "#FF0000"
+
