@@ -74,14 +74,12 @@ jobs:
             echo "critical_found=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Send Slack Notification
+      - name: Send Discord Notification
         if: steps.vulncheck.outputs.critical_found == 'true'
-        uses: rtCamp/action-slack-notify@v2
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          SLACK_USERNAME: "VulnBank Security Bot"
-          SLACK_TITLE: "⚠️ Critical Vulnerability Detected!"
-          SLACK_MESSAGE: |
-            Pipeline menemukan vulnerability **CRITICAL** pada repo vuln-bank.
+        uses: Ilshidur/action-discord@master
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          message: |
+            ⚠️ Critical vulnerability detected in **vuln-bank** repo!
             Cek detail report di GitHub Actions artifacts.
-          SLACK_COLOR: "#FF0000"
+
