@@ -1,1 +1,17 @@
+name: First Pipeline Test
 
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Print hello
+        run: echo "Pipeline jalan! 🚀"
