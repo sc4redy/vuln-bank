@@ -85,4 +85,3 @@ jobs:
             Pipeline menemukan vulnerability **CRITICAL** pada repo vuln-bank.
             Cek detail report di GitHub Actions artifacts.
           SLACK_COLOR: "#FF0000"
-
