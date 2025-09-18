@@ -31,8 +31,10 @@ jobs:
 
       - name: Install CLI tooling
         run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
           python -m pip install --upgrade pip
-          pip install pip-audit bandit jq
+          pip install pip-audit bandit
 
       # Secret scanning
       - name: Run Gitleaks (secret scanning)
@@ -150,14 +152,42 @@ jobs:
           if [ -f report_html.html ]; then mv report_html.html zap-report.html; fi
         continue-on-error: true
 
-      - name: Upload ZAP reports
+      - name: Fallback DAST with Nikto if ZAP JSON missing
+        run: |
+          # Jika ZAP tidak menghasilkan JSON, lakukan fallback dengan Nikto
+          if [ -f zap-report.json ]; then
+            echo "ZAP report found; skipping Nikto fallback."
+            exit 0
+          fi
+
+          echo "No zap-report.json found — running Nikto fallback DAST..."
+          # install nikto if missing (Debian runner)
+          sudo apt-get update -y
+          sudo apt-get install -y nikto
+          # run nikto against local app (sesuaikan port jika beda)
+          nikto -h http://127.0.0.1:5000 -output nikto-report.txt || true
+          # make sure a file exists even if nikto failed
+          if [ ! -f nikto-report.txt ]; then
+            echo "nikto produced no output" > nikto-report.txt
+          fi
+        continue-on-error: true
+
+      - name: Collect DAST artifacts (safe)
+        if: always()
+        run: |
+          mkdir -p dast_artifacts
+          for f in zap-report.json zap-report.md zap-report.html nikto-report.txt; do
+            if [ -f "$f" ]; then
+              mv "$f" dast_artifacts/ || true
+            fi
+          done
+
+      - name: Upload DAST artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zap-report
-          path: |
-            zap-report.json
-            zap-report.md
-            zap-report.html
+          name: dast-reports
+          path: dast_artifacts/
 
       # ----------------------
       # Aggregate (tool-specific parsing using jq)
@@ -169,7 +199,7 @@ jobs:
           mkdir -p reports
 
           # Copy available reports (silently ignore missing)
-          for f in gitleaks-report.json pip-audit.json bandit-report.json trivy-config-report.json trivy-image-report.json zap-report.json zap-report.md zap-report.html; do
+          for f in gitleaks-report.json pip-audit.json bandit-report.json trivy-config-report.json trivy-image-report.json zap-report.json zap-report.md zap-report.html nikto-report.txt; do
             if [ -f "$f" ]; then
               cp "$f" reports/
             fi
@@ -182,6 +212,7 @@ jobs:
           ZAP_COUNT=0
           PIPAUDIT_COUNT=0
           GITLEAKS_COUNT=0
+          NIKTO_COUNT=0
 
           # Bandit: results[].issue_severity (values: LOW/MEDIUM/HIGH)
           if [ -f bandit-report.json ]; then
@@ -193,10 +224,9 @@ jobs:
             TRIVY_IMAGE_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH")] | length' trivy-image-report.json 2>/dev/null || echo 0)
           fi
 
-          # Trivy config: may have Results[].Misconfigurations or similar; check Vulnerabilities too
+          # Trivy config
           if [ -f trivy-config-report.json ]; then
             TRIVY_CONFIG_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH")] | length' trivy-config-report.json 2>/dev/null || echo 0)
-            # fallback: check for misconfiguration findings presence
             if [ "$TRIVY_CONFIG_COUNT" -eq 0 ]; then
               TRIVY_CONFIG_COUNT=$(jq '[.Results[]? | .MisconfSummary? // empty | select(. != null)] | length' trivy-config-report.json 2>/dev/null || echo 0)
             fi
@@ -207,20 +237,48 @@ jobs:
             ZAP_COUNT=$(jq '[.site[]?.alerts[]? | select(.risk | test("High|Critical"; "i"))] | length' zap-report.json 2>/dev/null || echo 0)
           fi
 
-          # pip-audit: flexible parsing (vulnerabilities may be under different keys)
+          # pip-audit
           if [ -f pip-audit.json ]; then
             PIPAUDIT_COUNT=$(jq '[.. | objects | .vulns? // .vulnerabilities? // .Vulnerabilities? // [] | .[]? | select((.severity? // .Severity?) | test("HIGH|CRITICAL"; "i"))] | length' pip-audit.json 2>/dev/null || echo 0)
           fi
 
-          # Gitleaks: if any findings (length > 0), treat as critical-worthy (policy)
+          # Gitleaks: if any findings (length > 0)
           if [ -f gitleaks-report.json ]; then
             GITLEAKS_COUNT=$(jq 'if type=="array" then length else 0 end' gitleaks-report.json 2>/dev/null || echo 0)
           fi
 
-          # Sum up
-          TOTAL=$((BANDIT_COUNT + TRIVY_IMAGE_COUNT + TRIVY_CONFIG_COUNT + ZAP_COUNT + PIPAUDIT_COUNT + GITLEAKS_COUNT))
+          # Nikto fallback: treat non-empty nikto-report.txt as 1+ findings (heuristic)
+          if [ -f nikto-report.txt ]; then
+            # count lines that look like vulnerabilities or OSVDB entries — fallback heuristic
+            NIKTO_COUNT=$(grep -Ei "OSVDB|Vulnerability|/admin|/login|404|500|Cross-Site" nikto-report.txt | wc -l || true)
+            # if no matches but file non-empty, set 1 so we know DAST found something or at least ran
+            if [ "$NIKTO_COUNT" -eq 0 ]; then
+              if [ -s nikto-report.txt ]; then
+                NIKTO_COUNT=1
+              fi
+            fi
+          fi
 
-          # write summary JSON using jq (avoids heredoc / YAML quoting issues)
+          # Sum up (ensure numeric)
+          BANDIT_COUNT=${BANDIT_COUNT:-0}
+          TRIVY_IMAGE_COUNT=${TRIVY_IMAGE_COUNT:-0}
+          TRIVY_CONFIG_COUNT=${TRIVY_CONFIG_COUNT:-0}
+          ZAP_COUNT=${ZAP_COUNT:-0}
+          PIPAUDIT_COUNT=${PIPAUDIT_COUNT:-0}
+          GITLEAKS_COUNT=${GITLEAKS_COUNT:-0}
+          NIKTO_COUNT=${NIKTO_COUNT:-0}
+
+          # Sanitize: make sure they're digits, otherwise coerce to 0
+          for v in BANDIT_COUNT TRIVY_IMAGE_COUNT TRIVY_CONFIG_COUNT ZAP_COUNT PIPAUDIT_COUNT GITLEAKS_COUNT NIKTO_COUNT; do
+            VAL=$(eval "printf '%s' \"\$$v\"")
+            if ! printf '%s' "$VAL" | grep -Eq '^[0-9]+$'; then
+              eval "$v=0"
+            fi
+          done
+
+          TOTAL=$((BANDIT_COUNT + TRIVY_IMAGE_COUNT + TRIVY_CONFIG_COUNT + ZAP_COUNT + PIPAUDIT_COUNT + GITLEAKS_COUNT + NIKTO_COUNT))
+
+          # write summary JSON using jq
           jq -n \
             --argjson bandit   "$BANDIT_COUNT" \
             --argjson trivy_img "$TRIVY_IMAGE_COUNT" \
@@ -228,6 +286,7 @@ jobs:
             --argjson zap      "$ZAP_COUNT" \
             --argjson pip      "$PIPAUDIT_COUNT" \
             --argjson gitleaks "$GITLEAKS_COUNT" \
+            --argjson nikto    "$NIKTO_COUNT" \
             --argjson total    "$TOTAL" \
             '{
               bandit_high_or_critical: $bandit,
@@ -236,6 +295,7 @@ jobs:
               zap_high_or_critical: $zap,
               pip_audit_high_or_critical: $pip,
               gitleaks_findings: $gitleaks,
+              nikto_findings: $nikto,
               total_high_or_critical: $total
             }' > summary.json
 
@@ -251,13 +311,13 @@ jobs:
         continue-on-error: false
 
       - name: Upload aggregated artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: all-reports
           path: |
             summary.json
             reports/
-            all-reports-raw.txt
 
       # Notify Discord if needed
       - name: Notify Discord (HIGH/CRITICAL)
@@ -284,9 +344,16 @@ jobs:
       - name: Tear down docker-compose (best-effort)
         if: always()
         run: |
-          if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then
-            docker-compose down -v || true
+          if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+            DC="docker compose"
+          elif command -v docker-compose >/dev/null 2>&1; then
+            DC="docker-compose"
+          else
+            echo "docker compose not available; nothing to tear down"
+            exit 0
           fi
+          echo "Tearing down with: $DC"
+          $DC down -v || true
 
       - name: Pipeline finished
         run: echo "Security pipeline finished. Check artifacts for reports."
