@@ -104,23 +104,31 @@ jobs:
             trivy-image-report.json
 
       # Start application via docker-compose (repo vuln-bank punya docker-compose.yml)
-      - name: Start application (docker-compose)
+      - name: Start application (docker-compose / docker compose)
         run: |
-          if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then
-            docker-compose up -d --build
-            # Wait for app readiness (adjust timeout if needed)
-            for i in $(seq 1 30); do
-              if curl -sS http://127.0.0.1:5000/ >/dev/null 2>&1; then
-                echo "app up"
-                break
-              fi
-              echo "waiting for app... ($i)"
-              sleep 3
-            done
+          set -e
+          # pilih command compose yang tersedia (prefer 'docker compose' (V2) jika ada)
+          if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+            DC="docker compose"
+          elif command -v docker-compose >/dev/null 2>&1; then
+            DC="docker-compose"
           else
-            echo "No docker-compose found; skipping docker-compose startup" >&2
+            echo "docker compose is not available on runner; skipping docker-compose startup (DAST may fail)." >&2
             exit 0
           fi
+
+          echo "Using compose command: $DC"
+          $DC up -d --build || true
+
+          # Wait for app readiness (adjust timeout if needed)
+          for i in $(seq 1 30); do
+            if curl -sS http://127.0.0.1:5000/ >/dev/null 2>&1; then
+              echo "app up"
+              break
+            fi
+            echo "waiting for app... ($i)"
+            sleep 3
+          done
         continue-on-error: true
 
       # DAST - ZAP baseline with JSON output
@@ -128,15 +136,18 @@ jobs:
         uses: zaproxy/action-baseline@v0.7.0
         with:
           target: "http://127.0.0.1:5000"
-          # Generate JSON and HTML output (some action versions support -J)
-          cmd_options: "-J -r zap-report.html"
-          output: zap-report.md
+          cmd_options: "-J -r report_html.html"
+          # gunakan image dari GHCR agar lebih andal (kurangi masalah Docker Hub)
+          docker_name: "ghcr.io/zaproxy/zap2docker-stable:latest"
+          # note: tidak gunakan 'output:' karena tidak didukung
         continue-on-error: true
 
-      - name: Ensure zap-report.json exists (action may output zap_report.json)
+      - name: Normalize ZAP outputs (rename default files)
         run: |
-          if [ -f zap-report.json ]; then exit 0; fi
-          if [ -f zap_report.json ]; then mv zap_report.json zap-report.json; fi
+          # action biasanya menghasilkan report_json.json / report_md.md / report_html.html
+          if [ -f report_json.json ]; then mv report_json.json zap-report.json; fi
+          if [ -f report_md.md ]; then mv report_md.md zap-report.md; fi
+          if [ -f report_html.html ]; then mv report_html.html zap-report.html; fi
         continue-on-error: true
 
       - name: Upload ZAP reports
