@@ -133,12 +133,10 @@ jobs:
           output: zap-report.md
         continue-on-error: true
 
-      - name: Ensure zap-report.json exists (action may output zap-report.json)
+      - name: Ensure zap-report.json exists (action may output zap_report.json)
         run: |
-          # some zap baseline versions output zap_report.json or zap-report.json, try to normalize
           if [ -f zap-report.json ]; then exit 0; fi
           if [ -f zap_report.json ]; then mv zap_report.json zap-report.json; fi
-          # If md exists but json doesn't, try to convert? (left as manual fallback)
         continue-on-error: true
 
       - name: Upload ZAP reports
@@ -211,18 +209,24 @@ jobs:
           # Sum up
           TOTAL=$((BANDIT_COUNT + TRIVY_IMAGE_COUNT + TRIVY_CONFIG_COUNT + ZAP_COUNT + PIPAUDIT_COUNT + GITLEAKS_COUNT))
 
-          # write summary JSON
-          cat > summary.json <<EOF
-{
-  "bandit_high_or_critical": $BANDIT_COUNT,
-  "trivy_image_high_or_critical": $TRIVY_IMAGE_COUNT,
-  "trivy_config_high_or_critical": $TRIVY_CONFIG_COUNT,
-  "zap_high_or_critical": $ZAP_COUNT,
-  "pip_audit_high_or_critical": $PIPAUDIT_COUNT,
-  "gitleaks_findings": $GITLEAKS_COUNT,
-  "total_high_or_critical": $TOTAL
-}
-EOF
+          # write summary JSON using jq (avoids heredoc / YAML quoting issues)
+          jq -n \
+            --argjson bandit   "$BANDIT_COUNT" \
+            --argjson trivy_img "$TRIVY_IMAGE_COUNT" \
+            --argjson trivy_cfg "$TRIVY_CONFIG_COUNT" \
+            --argjson zap      "$ZAP_COUNT" \
+            --argjson pip      "$PIPAUDIT_COUNT" \
+            --argjson gitleaks "$GITLEAKS_COUNT" \
+            --argjson total    "$TOTAL" \
+            '{
+              bandit_high_or_critical: $bandit,
+              trivy_image_high_or_critical: $trivy_img,
+              trivy_config_high_or_critical: $trivy_cfg,
+              zap_high_or_critical: $zap,
+              pip_audit_high_or_critical: $pip,
+              gitleaks_findings: $gitleaks,
+              total_high_or_critical: $total
+            }' > summary.json
 
           # Export outputs for later steps
           if [ "$TOTAL" -gt 0 ]; then
@@ -252,9 +256,8 @@ EOF
             echo "No DISCORD_WEBHOOK configured; skipping notification" >&2
             exit 0
           fi
-          PAYLOAD=$(jq -n --arg repo "${{ github.repository }}" --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --argjson summary "$(cat summary.json)" \
-            '{"content": ("⚠️ *Security alert*: HIGH/CRITICAL findings in "+$repo+"\nRun: "+$url), "embeds":[{"title":"Summary","description":( $summary | tostring)}] }')
+          SUMMARY_STR=$(jq -c . summary.json)
+          PAYLOAD=$(jq -n --arg repo "${{ github.repository }}" --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --arg summary "$SUMMARY_STR" '{"content": ("⚠️ *Security alert*: HIGH/CRITICAL findings in "+$repo+"\nRun: "+$url), "embeds":[{"title":"Summary","description": $summary}] }')
           curl -s -H "Content-Type: application/json" -d "$PAYLOAD" "${{ secrets.DISCORD_WEBHOOK }}"
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
