@@ -1,86 +1,278 @@
-name: Security Pipeline - Step 4
+name: Security Pipeline - Vuln Bank (Complete & Parsed)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  # Jika ingin memaksa fail job saat ada HIGH/CRITICAL -> set "true"
+  FAIL_ON_HIGH: "false"
 
 jobs:
   security:
     runs-on: ubuntu-latest
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ✅ Secret Scanning
-      - name: Run gitleaks (Secret Scanning)
-        uses: gitleaks/gitleaks-action@v2
-        with:
-          args: detect --source . --no-git -v
-
-      # ✅ Setup Python
-      - name: Setup Python
+      - name: Setup Python 3.9
         uses: actions/setup-python@v4
         with:
           python-version: "3.9"
 
-      # ✅ Install dependencies + tools
-      - name: Install dependencies
+      - name: Install CLI tooling
         run: |
           python -m pip install --upgrade pip
-          pip install pip-audit bandit
+          pip install pip-audit bandit jq
 
-      # ✅ Run SCA
-      - name: Run pip-audit (SCA)
-        run: pip-audit || true
+      # Secret scanning
+      - name: Run Gitleaks (secret scanning)
+        uses: zricethezav/gitleaks-action@v2
+        with:
+          args: detect --source . --no-git -v --report-format json --report-path gitleaks-report.json
+        continue-on-error: true
 
-      # ✅ Run SAST
-      - name: Run Bandit (SAST)
-        run: bandit -r . -f txt -o bandit-report.txt || true
+      - name: Upload Gitleaks artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
 
-      # ✅ Upload Bandit Report
-      - name: Upload Bandit Report
+      # SCA
+      - name: Run pip-audit (SCA) -> JSON
+        run: |
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt --format=json -o pip-audit.json || true
+          else
+            pip-audit --format=json -o pip-audit.json || true
+          fi
+
+      - name: Upload pip-audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: pip-audit.json
+
+      # SAST
+      - name: Run Bandit (SAST) -> JSON
+        run: |
+          bandit -r . -f json -o bandit-report.json || true
+
+      - name: Upload Bandit report
         uses: actions/upload-artifact@v4
         with:
           name: bandit-report
-          path: bandit-report.txt
+          path: bandit-report.json
 
-      # ✅ Run Misconfiguration Scan (Trivy)
-      - name: Run Trivy Config Scan
+      # Trivy (config + image)
+      - name: Run Trivy config scan
         uses: aquasecurity/trivy-action@0.20.0
         with:
           scan-type: config
-          format: table
-          output: trivy-config-report.txt
+          format: json
+          output: trivy-config-report.json
+        continue-on-error: true
 
-      # ✅ Upload Trivy Config Report
-      - name: Upload Trivy Config Report
+      - name: Build Docker image (for image scan & DAST)
+        run: |
+          docker build -t vuln-bank:ci . || true
+
+      - name: Run Trivy image scan
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          scan-type: image
+          image-ref: vuln-bank:ci
+          format: json
+          output: trivy-image-report.json
+        continue-on-error: true
+
+      - name: Upload Trivy reports
         uses: actions/upload-artifact@v4
         with:
-          name: trivy-config-report
-          path: trivy-config-report.txt
+          name: trivy-reports
+          path: |
+            trivy-config-report.json
+            trivy-image-report.json
 
-      # ✅ Check for Critical Vulnerabilities and Notify Slack
-      - name: Check for Critical Vulns
+      # Start application via docker-compose (repo vuln-bank punya docker-compose.yml)
+      - name: Start application (docker-compose)
+        run: |
+          if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then
+            docker-compose up -d --build
+            # Wait for app readiness (adjust timeout if needed)
+            for i in $(seq 1 30); do
+              if curl -sS http://127.0.0.1:5000/ >/dev/null 2>&1; then
+                echo "app up"
+                break
+              fi
+              echo "waiting for app... ($i)"
+              sleep 3
+            done
+          else
+            echo "No docker-compose found; skipping docker-compose startup" >&2
+            exit 0
+          fi
+        continue-on-error: true
+
+      # DAST - ZAP baseline with JSON output
+      - name: Run OWASP ZAP Baseline Scan (DAST) -> JSON + HTML
+        uses: zaproxy/action-baseline@v0.7.0
+        with:
+          target: "http://127.0.0.1:5000"
+          # Generate JSON and HTML output (some action versions support -J)
+          cmd_options: "-J -r zap-report.html"
+          output: zap-report.md
+        continue-on-error: true
+
+      - name: Ensure zap-report.json exists (action may output zap-report.json)
+        run: |
+          # some zap baseline versions output zap_report.json or zap-report.json, try to normalize
+          if [ -f zap-report.json ]; then exit 0; fi
+          if [ -f zap_report.json ]; then mv zap_report.json zap-report.json; fi
+          # If md exists but json doesn't, try to convert? (left as manual fallback)
+        continue-on-error: true
+
+      - name: Upload ZAP reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: |
+            zap-report.json
+            zap-report.md
+            zap-report.html
+
+      # ----------------------
+      # Aggregate (tool-specific parsing using jq)
+      # ----------------------
+      - name: Aggregate reports & check severity (HIGH/CRITICAL)
         id: vulncheck
         run: |
-          # Gabung semua report jadi satu file
-          cat bandit-report.txt trivy-config-report.txt > all-reports.txt
-          if grep -qi "CRITICAL" all-reports.txt; then
-            echo "critical_found=true" >> $GITHUB_OUTPUT
-          else
-            echo "critical_found=false" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          mkdir -p reports
+
+          # Copy available reports (silently ignore missing)
+          for f in gitleaks-report.json pip-audit.json bandit-report.json trivy-config-report.json trivy-image-report.json zap-report.json zap-report.md zap-report.html; do
+            if [ -f "$f" ]; then
+              cp "$f" reports/
+            fi
+          done
+
+          # initialise counts
+          BANDIT_COUNT=0
+          TRIVY_IMAGE_COUNT=0
+          TRIVY_CONFIG_COUNT=0
+          ZAP_COUNT=0
+          PIPAUDIT_COUNT=0
+          GITLEAKS_COUNT=0
+
+          # Bandit: results[].issue_severity (values: LOW/MEDIUM/HIGH)
+          if [ -f bandit-report.json ]; then
+            BANDIT_COUNT=$(jq '[.results[]? | select((.issue_severity|ascii_downcase)=="high" or (.issue_severity|ascii_downcase)=="critical")] | length' bandit-report.json 2>/dev/null || echo 0)
           fi
 
-      - name: Send Discord Notification
-        if: steps.vulncheck.outputs.critical_found == 'true'
-        uses: Ilshidur/action-discord@master
+          # Trivy image: Results[].Vulnerabilities[].Severity
+          if [ -f trivy-image-report.json ]; then
+            TRIVY_IMAGE_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH")] | length' trivy-image-report.json 2>/dev/null || echo 0)
+          fi
+
+          # Trivy config: may have Results[].Misconfigurations or similar; check Vulnerabilities too
+          if [ -f trivy-config-report.json ]; then
+            TRIVY_CONFIG_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH")] | length' trivy-config-report.json 2>/dev/null || echo 0)
+            # fallback: check for misconfiguration findings presence
+            if [ "$TRIVY_CONFIG_COUNT" -eq 0 ]; then
+              TRIVY_CONFIG_COUNT=$(jq '[.Results[]? | .MisconfSummary? // empty | select(. != null)] | length' trivy-config-report.json 2>/dev/null || echo 0)
+            fi
+          fi
+
+          # ZAP: site[].alerts[].risk (values like "Low","Medium","High")
+          if [ -f zap-report.json ]; then
+            ZAP_COUNT=$(jq '[.site[]?.alerts[]? | select(.risk | test("High|Critical"; "i"))] | length' zap-report.json 2>/dev/null || echo 0)
+          fi
+
+          # pip-audit: flexible parsing (vulnerabilities may be under different keys)
+          if [ -f pip-audit.json ]; then
+            PIPAUDIT_COUNT=$(jq '[.. | objects | .vulns? // .vulnerabilities? // .Vulnerabilities? // [] | .[]? | select((.severity? // .Severity?) | test("HIGH|CRITICAL"; "i"))] | length' pip-audit.json 2>/dev/null || echo 0)
+          fi
+
+          # Gitleaks: if any findings (length > 0), treat as critical-worthy (policy)
+          if [ -f gitleaks-report.json ]; then
+            GITLEAKS_COUNT=$(jq 'if type=="array" then length else 0 end' gitleaks-report.json 2>/dev/null || echo 0)
+          fi
+
+          # Sum up
+          TOTAL=$((BANDIT_COUNT + TRIVY_IMAGE_COUNT + TRIVY_CONFIG_COUNT + ZAP_COUNT + PIPAUDIT_COUNT + GITLEAKS_COUNT))
+
+          # write summary JSON
+          cat > summary.json <<EOF
+{
+  "bandit_high_or_critical": $BANDIT_COUNT,
+  "trivy_image_high_or_critical": $TRIVY_IMAGE_COUNT,
+  "trivy_config_high_or_critical": $TRIVY_CONFIG_COUNT,
+  "zap_high_or_critical": $ZAP_COUNT,
+  "pip_audit_high_or_critical": $PIPAUDIT_COUNT,
+  "gitleaks_findings": $GITLEAKS_COUNT,
+  "total_high_or_critical": $TOTAL
+}
+EOF
+
+          # Export outputs for later steps
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "high_or_critical_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "high_or_critical_found=false" >> $GITHUB_OUTPUT
+          fi
+
+          # For debugging: show summary
+          cat summary.json
+        continue-on-error: false
+
+      - name: Upload aggregated artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-reports
+          path: |
+            summary.json
+            reports/
+            all-reports-raw.txt
+
+      # Notify Discord if needed
+      - name: Notify Discord (HIGH/CRITICAL)
+        if: steps.vulncheck.outputs.high_or_critical_found == 'true'
+        run: |
+          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "No DISCORD_WEBHOOK configured; skipping notification" >&2
+            exit 0
+          fi
+          PAYLOAD=$(jq -n --arg repo "${{ github.repository }}" --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson summary "$(cat summary.json)" \
+            '{"content": ("⚠️ *Security alert*: HIGH/CRITICAL findings in "+$repo+"\nRun: "+$url), "embeds":[{"title":"Summary","description":( $summary | tostring)}] }')
+          curl -s -H "Content-Type: application/json" -d "$PAYLOAD" "${{ secrets.DISCORD_WEBHOOK }}"
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        with:
-          args: |
-            ⚠️ Critical vulnerability detected in **vuln-bank** repo!
-            Cek detail report di GitHub Actions artifacts.
 
+      # Optionally fail the job if configured
+      - name: Fail job on HIGH/CRITICAL if configured
+        if: steps.vulncheck.outputs.high_or_critical_found == 'true' && env.FAIL_ON_HIGH == 'true'
+        run: |
+          echo "HIGH/CRITICAL found and FAIL_ON_HIGH=true -> failing job"
+          exit 1
+
+      # Tear down app
+      - name: Tear down docker-compose (best-effort)
+        if: always()
+        run: |
+          if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then
+            docker-compose down -v || true
+          fi
+
+      - name: Pipeline finished
+        run: echo "Security pipeline finished. Check artifacts for reports."
