@@ -145,47 +145,47 @@ jobs:
     - name: Aggregate critical findings -> reports/critical-findings.json
       run: |
         python - <<'PY'
-import json,glob,os
-workspace = os.environ.get('GITHUB_WORKSPACE', '.')
-report_dir = os.environ.get('REPORT_DIR', 'reports')
-out = {"critical_findings": []}
-
-search_path = os.path.join(workspace, report_dir, "*.json")
-for f in glob.glob(search_path):
-    try:
-        j = json.load(open(f, 'r', encoding='utf-8'))
-    except Exception:
-        continue
-
-    def walk(obj, path=''):
-        findings = []
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                # check immediate value
-                try:
-                    if isinstance(v, str) and v.lower() in ('critical', 'high'):
-                        findings.append({'file': f, 'path': path + '/' + k, 'value': v})
-                except:
-                    pass
-                # recurse
-                findings += walk(v, path + '/' + k)
-        elif isinstance(obj, list):
-            for idx, item in enumerate(obj):
-                findings += walk(item, path + f'[{idx}]')
-        return findings
-
-    found = walk(j)
-    for item in found:
-        item['source'] = os.path.basename(f)
-        out['critical_findings'].append(item)
-
-os.makedirs(os.path.join(workspace, report_dir), exist_ok=True)
-with open(os.path.join(workspace, report_dir, 'critical-findings.json'), 'w', encoding='utf-8') as fh:
-    json.dump(out, fh, indent=2)
-print("Wrote", os.path.join(workspace, report_dir, 'critical-findings.json'))
-PY
-      shell: bash
-      continue-on-error: true
+        import json,glob,os
+        workspace = os.environ.get('GITHUB_WORKSPACE', '.')
+        report_dir = os.environ.get('REPORT_DIR', 'reports')
+        out = {"critical_findings": []}
+        
+        search_path = os.path.join(workspace, report_dir, "*.json")
+        for f in glob.glob(search_path):
+            try:
+                j = json.load(open(f, 'r', encoding='utf-8'))
+            except Exception:
+                continue
+        
+            def walk(obj, path=''):
+                findings = []
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        # check immediate value
+                        try:
+                            if isinstance(v, str) and v.lower() in ('critical', 'high'):
+                                findings.append({'file': f, 'path': path + '/' + k, 'value': v})
+                        except:
+                            pass
+                        # recurse
+                        findings += walk(v, path + '/' + k)
+                elif isinstance(obj, list):
+                    for idx, item in enumerate(obj):
+                        findings += walk(item, path + f'[{idx}]')
+                return findings
+        
+            found = walk(j)
+            for item in found:
+                item['source'] = os.path.basename(f)
+                out['critical_findings'].append(item)
+        
+        os.makedirs(os.path.join(workspace, report_dir), exist_ok=True)
+        with open(os.path.join(workspace, report_dir, 'critical-findings.json'), 'w', encoding='utf-8') as fh:
+            json.dump(out, fh, indent=2)
+        print("Wrote", os.path.join(workspace, report_dir, 'critical-findings.json'))
+        PY
+              shell: bash
+              continue-on-error: true
 
     #### Create GitHub Issue if critical findings exist (bonus) ####
     - name: Create GitHub Issue for critical findings
