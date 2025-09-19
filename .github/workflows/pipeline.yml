@@ -1,163 +1,242 @@
-name: Security Scan Pipeline - single job
+name: DevSecOps CI - Vuln Bank
 
 on:
-  pull_request:
-    branches: [ main ]
   push:
-    branches: [ main ]
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+env:
+  REPORT_DIR: reports
+  APP_PORT: 5000
+  APP_URL: http://localhost:${{ env.APP_PORT }}
 
 jobs:
-  security-scan-all:
+  build-and-scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
 
-      - name: Prepare reports dir
-        run: mkdir -p security-reports
+    - name: Prepare reports folder
+      run: |
+        rm -rf ${{ env.REPORT_DIR }} || true
+        mkdir -p ${{ env.REPORT_DIR }}
 
-      ####################################################
-      # Secret Scanning (TruffleHog) - non-blocking
-      ####################################################
-      - name: Run TruffleHog (secret scanning)
-        run: |
-          echo "Running trufflehog (may download binary)..."
-          curl -sSL https://github.com/trufflesecurity/trufflehog/releases/download/v3.6.0/trufflehog-linux-amd64 -o trufflehog || true
-          chmod +x trufflehog || true
-          # scan workspace filesystem and output JSON
-          ./trufflehog --json filesystem . > security-reports/trufflehog.json || true
+    - name: Install python deps (project)
+      if: exists('requirements.txt')
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+      shell: bash
 
-      ####################################################
-      # SCA for Python (pip-audit) - non-blocking
-      ####################################################
-      - name: Install pip-audit and dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pip-audit || true
+    - name: Quick lint (non-blocking)
+      run: |
+        python -m pip install flake8 || true
+        flake8 || true
+      continue-on-error: true
 
-      - name: Run pip-audit (SCA)
-        run: |
-          pip-audit -r requirements.txt -f json -o security-reports/pip-audit.json || true
+    #### Secret scanning (Gitleaks) ####
+    - name: Gitleaks secret scan (detect hardcoded secrets)
+      uses: zricethezav/gitleaks-action@v2
+      with:
+        args: detect --source . --report-format json --report-path ${{ github.workspace }}/${{ env.REPORT_DIR }}/gitleaks.json
+      continue-on-error: true
 
-      ####################################################
-      # SAST - CodeQL (Python)
-      # CodeQL action will run its own analysis and upload SARIF
-      ####################################################
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v2
-        with:
-          languages: python
+    #### SCA - pip-audit ####
+    - name: pip-audit (SCA) - JSON report
+      run: |
+        python -m pip install pip-audit
+        if [ -f requirements.txt ]; then
+          pip-audit -r requirements.txt -f json -o ${{ env.REPORT_DIR }}/pip-audit.json || true
+        else
+          pip-audit -f json -o ${{ env.REPORT_DIR }}/pip-audit.json || true
+        fi
+      shell: bash
+      continue-on-error: true
 
-      - name: Build for CodeQL (autobuild)
-        uses: github/codeql-action/autobuild@v2
+    #### SAST - Semgrep (general) ####
+    - name: Semgrep (SAST) - JSON report
+      run: |
+        python -m pip install semgrep
+        semgrep --config=p/ci --json --output ${{ env.REPORT_DIR }}/semgrep.json || true
+      shell: bash
+      continue-on-error: true
 
-      - name: Run CodeQL analysis
-        uses: github/codeql-action/analyze@v2
+    #### SAST - Semgrep (OWASP Top 10) ####
+    - name: Semgrep (OWASP Top 10) - JSON report
+      run: |
+        python -m pip install semgrep
+        semgrep --config p/owasp-top-10 --json --output ${{ env.REPORT_DIR }}/semgrep-owasp.json || true
+      shell: bash
+      continue-on-error: true
 
-      ####################################################
-      # Misconfiguration - hadolint on Dockerfile
-      ####################################################
-      - name: Run hadolint on Dockerfile
-        run: |
-          # use hadolint container to lint Dockerfile
-          docker run --rm -i hadolint/hadolint:2.9.0 hadolint -f json Dockerfile > security-reports/hadolint.json || true
+    #### Additional Python SAST: Bandit ####
+    - name: Bandit (Python SAST) - JSON
+      run: |
+        python -m pip install bandit
+        bandit -r . -f json -o ${{ env.REPORT_DIR }}/bandit.json || true
+      shell: bash
+      continue-on-error: true
 
-      ####################################################
-      # Build & Start app via docker-compose for DAST
-      ####################################################
-      - name: Build and start app with docker-compose
-        run: |
-          docker-compose up -d --build || true
-          # wait for app to be up (port 5000 assumed)
-          for i in {1..30}; do
-            if curl -sSf http://localhost:5000/ >/dev/null 2>&1; then
-              echo "app reachable"
-              break
-            fi
-            echo "waiting for app to come up..."
-            sleep 3
-          done
+    #### Misconfiguration scanning - Checkov ####
+    - name: Checkov (infra / docker-compose / dockerfile) - JSON
+      uses: bridgecrewio/checkov-action@v13
+      with:
+        directory: .
+        output_format: json
+        quiet: true
+        output_file: ${{ env.REPORT_DIR }}/checkov.json
+      continue-on-error: true
 
-      ####################################################
-      # DAST - OWASP ZAP baseline scan
-      ####################################################
-      - name: Run OWASP ZAP baseline scan
-        run: |
-          mkdir -p security-reports
-          # use host networking so zap can reach localhost services (linux runner)
-          docker run --rm --network host -v "$(pwd)/security-reports":/zap/wrk/:rw owasp/zap2docker-stable \
-            zap-baseline.py -t http://localhost:5000 -r zap_report.html -J zap_report.json || true
-          # ensure files present (some runners may need host.docker.internal instead)
-          ls -la security-reports || true
+    #### Build + Run application (docker-compose or Dockerfile) ####
+    - name: Build and run app with docker-compose / Dockerfile
+      run: |
+        if [ -f docker-compose.yml ]; then
+          docker-compose up -d --build
+        elif [ -f Dockerfile ]; then
+          docker build -t vuln-bank:ci .
+          docker run -d -p ${APP_PORT}:${APP_PORT} --name vuln-bank-ci vuln-bank:ci
+        else
+          echo "No docker-compose.yml or Dockerfile found; skipping runtime setup for DAST"
+        fi
 
-      ####################################################
-      # Collect additional info (pip freeze, docker ps)
-      ####################################################
-      - name: Environment & helper outputs
-        run: |
-          python -V > security-reports/python_version.txt || true
-          pip freeze > security-reports/pip_freeze.txt || true
-          docker ps --format "{{.Names}} {{.Image}} {{.Status}}" > security-reports/docker_ps.txt || true
-
-      ####################################################
-      # Upload all reports as artifact (always)
-      ####################################################
-      - name: Upload security reports
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: security-reports
-          path: security-reports/**
-
-      ####################################################
-      # Tear down docker-compose (best-effort)
-      ####################################################
-      - name: Tear down docker-compose
-        if: always()
-        run: docker-compose down || true
-
-      # Notify Discord if needed
-      - name: Notify Discord (HIGH/CRITICAL)
-        if: steps.vulncheck.outputs.high_or_critical_found == 'true'
-        run: |
-          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
-            echo "No DISCORD_WEBHOOK configured; skipping notification" >&2
-            exit 0
+        # wait for app to be ready (best-effort)
+        for i in {1..30}; do
+          if curl -sSf ${APP_URL} >/dev/null 2>&1; then
+            echo "App is up"
+            break
           fi
-          SUMMARY_STR=$(jq -c . summary.json)
-          PAYLOAD=$(jq -n --arg repo "${{ github.repository }}" --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --arg summary "$SUMMARY_STR" '{"content": ("⚠️ *Security alert*: HIGH/CRITICAL findings in "+$repo+"\nRun: "+$url), "embeds":[{"title":"Summary","description": $summary}] }')
-          curl -s -H "Content-Type: application/json" -d "$PAYLOAD" "${{ secrets.DISCORD_WEBHOOK }}"
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          echo "Waiting for app to be up..."
+          sleep 2
+        done
+      env:
+        APP_PORT: ${{ env.APP_PORT }}
+        APP_URL: ${{ env.APP_URL }}
+      shell: bash
+      continue-on-error: true
 
-      # Optionally fail the job if configured
-      - name: Fail job on HIGH/CRITICAL if configured
-        if: steps.vulncheck.outputs.high_or_critical_found == 'true' && env.FAIL_ON_HIGH == 'true'
-        run: |
-          echo "HIGH/CRITICAL found and FAIL_ON_HIGH=true -> failing job"
-          exit 1
+    #### DAST - OWASP ZAP baseline ####
+    - name: OWASP ZAP baseline scan (DAST) - HTML + JSON
+      run: |
+        mkdir -p /tmp/zap-reports
+        docker run --rm -v /tmp/zap-reports:/zap/reports --network host owasp/zap2docker-stable zap-baseline.py -t "${{ env.APP_URL }}" -r /zap/reports/zap_report.html -J /zap/reports/zap_report.json -q || true
+        cp /tmp/zap-reports/* ${{ github.workspace }}/${{ env.REPORT_DIR }}/ || true
+      env:
+        APP_URL: ${{ env.APP_URL }}
+      shell: bash
+      continue-on-error: true
 
-      # Tear down app
-      - name: Tear down docker-compose (best-effort)
-        if: always()
-        run: |
-          if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-            DC="docker compose"
-          elif command -v docker-compose >/dev/null 2>&1; then
-            DC="docker-compose"
-          else
-            echo "docker compose not available; nothing to tear down"
-            exit 0
-          fi
-          echo "Tearing down with: $DC"
-          $DC down -v || true
+    #### Aggregate critical findings -> reports/critical-findings.json ####
+    - name: Aggregate critical findings -> reports/critical-findings.json
+      run: |
+        python - <<'PY'
+import json,glob,os
+workspace = os.environ.get('GITHUB_WORKSPACE', '.')
+report_dir = os.environ.get('REPORT_DIR', 'reports')
+out = {"critical_findings": []}
 
-      - name: Pipeline finished
-        run: echo "Security pipeline finished. Check artifacts for reports."
+search_path = os.path.join(workspace, report_dir, "*.json")
+for f in glob.glob(search_path):
+    try:
+        j = json.load(open(f, 'r', encoding='utf-8'))
+    except Exception:
+        continue
+
+    def walk(obj, path=''):
+        findings = []
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                # check immediate value
+                try:
+                    if isinstance(v, str) and v.lower() in ('critical', 'high'):
+                        findings.append({'file': f, 'path': path + '/' + k, 'value': v})
+                except:
+                    pass
+                # recurse
+                findings += walk(v, path + '/' + k)
+        elif isinstance(obj, list):
+            for idx, item in enumerate(obj):
+                findings += walk(item, path + f'[{idx}]')
+        return findings
+
+    found = walk(j)
+    for item in found:
+        item['source'] = os.path.basename(f)
+        out['critical_findings'].append(item)
+
+os.makedirs(os.path.join(workspace, report_dir), exist_ok=True)
+with open(os.path.join(workspace, report_dir, 'critical-findings.json'), 'w', encoding='utf-8') as fh:
+    json.dump(out, fh, indent=2)
+print("Wrote", os.path.join(workspace, report_dir, 'critical-findings.json'))
+PY
+      shell: bash
+      continue-on-error: true
+
+    #### Create GitHub Issue if critical findings exist (bonus) ####
+    - name: Create GitHub Issue for critical findings
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          const path = 'reports/critical-findings.json';
+          if (!fs.existsSync(path)) {
+            console.log('No critical-findings.json found — skipping issue creation.');
+            return;
+          }
+          const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+          const items = data.critical_findings || [];
+          if (items.length === 0) {
+            console.log('No critical findings — nothing to do.');
+            return;
+          }
+          const max = 10;
+          let body = `Automated report: ${items.length} critical/high findings detected by DevSecOps CI.\n\n`;
+          body += "Summary (showing up to " + max + " findings):\n\n";
+          items.slice(0, max).forEach((it, idx) => {
+            body += `**${idx+1}.** source: ${it.source || 'unknown'} — path: ${it.path || 'N/A'} — value: ${it.value || 'N/A'}\n\n`;
+          });
+          body += "\nFull reports are attached as pipeline artifacts (devsecops-reports).";
+          const title = `CRITICAL vulnerabilities detected — ${items.length} findings`;
+          await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: title,
+            body: body,
+            labels: ['security','critical']
+          });
+
+    #### Stop containers (cleanup) ####
+    - name: Stop containers / cleanup
+      run: |
+        if docker ps -a --format '{{.Names}}' | grep -q vuln-bank-ci; then
+          docker stop vuln-bank-ci || true
+          docker rm vuln-bank-ci || true
+        fi
+        if [ -f docker-compose.yml ]; then
+          docker-compose down --volumes || true
+        fi
+      shell: bash
+      continue-on-error: true
+
+    #### Upload all reports as artifacts ####
+    - name: Upload reports artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: devsecops-reports
+        path: ${{ env.REPORT_DIR }}
