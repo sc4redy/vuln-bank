@@ -1,4 +1,4 @@
-name: Security Scan Pipeline
+name: Security Scan Pipeline - single job
 
 on:
   pull_request:
@@ -7,89 +7,125 @@ on:
     branches: [ main ]
 
 jobs:
-  secret-scan:
+  security-scan-all:
     runs-on: ubuntu-latest
+    services:
+      # Optional: you can remove -- we use docker-compose instead
+      # kept empty here; docker-compose will run the app itself
+      # (runner has docker available)
     steps:
-      - uses: actions/checkout@v4
-      - name: Run TruffleHog
-        run: |
-          mkdir -p reports
-          curl -sSL https://github.com/trufflesecurity/trufflehog/releases/download/v3.6.0/trufflehog-linux-amd64 -o trufflehog
-          chmod +x trufflehog
-          ./trufflehog filesystem --json . > reports/trufflehog.json || true
-      - uses: actions/upload-artifact@v3
-        with:
-          name: secret-scan-report
-          path: reports/trufflehog.json
-
-  sca:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Python deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install pip-audit
-      - name: Run pip-audit (SCA)
-        run: |
-          mkdir -p reports
-          pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true
-      - uses: actions/upload-artifact@v3
-        with:
-          name: sca-report
-          path: reports/pip-audit.json
-
-  sast:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Init CodeQL
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Prepare reports dir
+        run: mkdir -p security-reports
+
+      ####################################################
+      # Secret Scanning (TruffleHog) - non-blocking
+      ####################################################
+      - name: Run TruffleHog (secret scanning)
+        run: |
+          echo "Running trufflehog (may download binary)..."
+          curl -sSL https://github.com/trufflesecurity/trufflehog/releases/download/v3.6.0/trufflehog-linux-amd64 -o trufflehog || true
+          chmod +x trufflehog || true
+          # scan workspace filesystem and output JSON
+          ./trufflehog --json filesystem . > security-reports/trufflehog.json || true
+
+      ####################################################
+      # SCA for Python (pip-audit) - non-blocking
+      ####################################################
+      - name: Install pip-audit and dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit || true
+
+      - name: Run pip-audit (SCA)
+        run: |
+          pip-audit -r requirements.txt -f json -o security-reports/pip-audit.json || true
+
+      ####################################################
+      # SAST - CodeQL (Python)
+      # CodeQL action will run its own analysis and upload SARIF
+      ####################################################
+      - name: Initialize CodeQL
         uses: github/codeql-action/init@v2
         with:
           languages: python
-      - name: Autobuild
+
+      - name: Build for CodeQL (autobuild)
         uses: github/codeql-action/autobuild@v2
-      - name: Run CodeQL Analysis
+
+      - name: Run CodeQL analysis
         uses: github/codeql-action/analyze@v2
 
-  misconfig:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run hadolint
+      ####################################################
+      # Misconfiguration - hadolint on Dockerfile
+      ####################################################
+      - name: Run hadolint on Dockerfile
         run: |
-          mkdir -p reports
-          docker run --rm -i hadolint/hadolint < Dockerfile > reports/hadolint.txt || true
-      - uses: actions/upload-artifact@v3
-        with:
-          name: hadolint-report
-          path: reports/hadolint.txt
+          # use hadolint container to lint Dockerfile
+          docker run --rm -i hadolint/hadolint:2.9.0 hadolint -f json Dockerfile > security-reports/hadolint.json || true
 
-  dast:
-    runs-on: ubuntu-latest
-    services:
-      web:
-        image: docker/compose:latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build & Run App with docker-compose
-        run: docker-compose up -d
-      - name: Wait for app
+      ####################################################
+      # Build & Start app via docker-compose for DAST
+      ####################################################
+      - name: Build and start app with docker-compose
         run: |
-          for i in {1..10}; do
-            curl -sSf http://localhost:5000 && break
-            sleep 5
+          docker-compose up -d --build || true
+          # wait for app to be up (port 5000 assumed)
+          for i in {1..30}; do
+            if curl -sSf http://localhost:5000/ >/dev/null 2>&1; then
+              echo "app reachable"
+              break
+            fi
+            echo "waiting for app to come up..."
+            sleep 3
           done
-      - name: Run OWASP ZAP Baseline
+
+      ####################################################
+      # DAST - OWASP ZAP baseline scan
+      ####################################################
+      - name: Run OWASP ZAP baseline scan
         run: |
-          mkdir -p reports
-          docker run --network host -v $(pwd)/reports:/zap/wrk/:rw owasp/zap2docker-stable zap-baseline.py -t http://localhost:5000 -r zap_report.html -J zap_report.json || true
-      - uses: actions/upload-artifact@v3
+          mkdir -p security-reports
+          # use host networking so zap can reach localhost services (linux runner)
+          docker run --rm --network host -v "$(pwd)/security-reports":/zap/wrk/:rw owasp/zap2docker-stable \
+            zap-baseline.py -t http://localhost:5000 -r zap_report.html -J zap_report.json || true
+          # ensure files present (some runners may need host.docker.internal instead)
+          ls -la security-reports || true
+
+      ####################################################
+      # Collect additional info (pip freeze, docker ps)
+      ####################################################
+      - name: Environment & helper outputs
+        run: |
+          python -V > security-reports/python_version.txt || true
+          pip freeze > security-reports/pip_freeze.txt || true
+          docker ps --format "{{.Names}} {{.Image}} {{.Status}}" > security-reports/docker_ps.txt || true
+
+      ####################################################
+      # Upload all reports as artifact (always)
+      ####################################################
+      - name: Upload security reports
+        uses: actions/upload-artifact@v3
+        if: always()
         with:
-          name: dast-report
-          path: reports/*
+          name: security-reports
+          path: security-reports/**
+
+      ####################################################
+      # Tear down docker-compose (best-effort)
+      ####################################################
+      - name: Tear down docker-compose
+        if: always()
+        run: docker-compose down || true
 
       # Notify Discord if needed
       - name: Notify Discord (HIGH/CRITICAL)
