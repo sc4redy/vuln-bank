@@ -9,10 +9,6 @@ on:
 jobs:
   security-scan-all:
     runs-on: ubuntu-latest
-    services:
-      # Optional: you can remove -- we use docker-compose instead
-      # kept empty here; docker-compose will run the app itself
-      # (runner has docker available)
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
