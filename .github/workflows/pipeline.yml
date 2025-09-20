@@ -105,7 +105,6 @@ jobs:
       - name: Start application (docker-compose / docker compose)
         run: |
           set -e
-          # pilih command compose yang tersedia (prefer 'docker compose' (V2) jika ada)
           if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
             DC="docker compose"
           elif command -v docker-compose >/dev/null 2>&1; then
@@ -128,7 +127,7 @@ jobs:
         continue-on-error: true
 
       # DAST - ZAP baseline with JSON output
-      - name: Run OWASP ZAP Baseline Scan (DAST) -> JSON + HTML
+      - name: Run OWASP ZAP Baseline Scan (DAST)
         uses: zaproxy/action-baseline@v0.7.0
         with:
           target: "http://127.0.0.1:5000"
@@ -179,7 +178,7 @@ jobs:
           name: dast-reports
           path: dast_artifacts/
 
-      # Aggregate (tool-specific parsing using jq)
+      # Aggregate
       - name: Aggregate reports & check severity (HIGH/CRITICAL)
         id: vulncheck
         run: |
@@ -314,7 +313,7 @@ jobs:
           exit 1
           
       # Tear down app
-      - name: Tear down docker-compose (best-effort)
+      - name: Tear down docker-compose
         if: always()
         run: |
           if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
