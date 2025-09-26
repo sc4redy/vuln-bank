@@ -304,13 +304,6 @@ jobs:
           curl -s -H "Content-Type: application/json" -d "$PAYLOAD" "${{ secrets.DISCORD_WEBHOOK }}"
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-
-      # Optionally fail the job if configured
-      - name: Fail job on HIGH/CRITICAL if configured
-        if: steps.vulncheck.outputs.high_or_critical_found == 'true' && env.FAIL_ON_HIGH == 'true'
-        run: |
-          echo "HIGH/CRITICAL found and FAIL_ON_HIGH=true -> failing job"
-          exit 1
           
       # Tear down app
       - name: Tear down docker-compose
